@@ -54,16 +54,58 @@ def fetch(org_id, token):
     return [e["node"] for e in out.get("data", {}).get("posts", {}).get("edges", [])]
 
 
+def fetch_errors(org_id, token):
+    """Recent FAILED (status=error) posts + their error message. Delivery-failure
+    detection — the cadence audit counts scheduled, not delivered, so a channel
+    can silently error (e.g. Instagram 'Invalid Credentials' token expiry) while
+    the queue reads 'compliant'. Added 2026-08-09 after IG auth expiry went
+    unnoticed until Buffer emailed."""
+    q = ("query($o: OrganizationId!){ posts(input:{organizationId:$o, "
+         "filter:{status:[error]}, sort:[{field:dueAt,direction:desc}]}, first:15)"
+         "{ edges{ node{ dueAt channelService error { message } } } } }")
+    body = json.dumps({"query": q, "variables": {"o": org_id}}).encode()
+    req = urllib.request.Request("https://api.buffer.com/graphql", data=body, method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+                 "User-Agent": "Mozilla/5.0 (queue_audit)"})
+    out = json.loads(urllib.request.urlopen(req, timeout=30).read())
+    return [e["node"] for e in out.get("data", {}).get("posts", {}).get("edges", [])]
+
+
 def isoweek(due):
     d = datetime.datetime.fromisoformat(due.replace("Z", "+00:00"))
     y, w, _ = d.date().isocalendar()
     return f"{y}-W{w:02d}"
 
 
+def _report_failures(now, toks):
+    """Print recent (last 14d) delivery failures across both brands, if any."""
+    cutoff = (now - datetime.timedelta(days=14)).date().isoformat()
+    fails = []
+    for brand, org in ORGS.items():
+        tok = toks.get(brand)
+        if not tok:
+            continue
+        try:
+            for n in fetch_errors(org, tok):
+                due = (n.get("dueAt") or "")[:10]
+                if due >= cutoff:
+                    msg = ((n.get("error") or {}).get("message") or "").strip()
+                    fails.append((brand, n.get("channelService", "?"), due, msg))
+        except Exception:
+            pass
+    if fails:
+        print("DELIVERY FAILURES (last 14 days — posts that ERRORED, not just scheduled):")
+        for b, ch, due, msg in fails:
+            print(f"  {b} {ch} {due}: {msg[:110]}")
+        print("  -> 'Invalid Credentials' = reconnect that channel in Buffer (Settings->Channels). Media/other = retry.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--floor", type=int, default=2)
     ap.add_argument("--weeks", type=int, default=4)
+    ap.add_argument("--failures-only", action="store_true",
+                    help="Skip cadence; only report recent delivery failures (fast, for the every-session hook).")
     args = ap.parse_args()
     cal, scy = tokens()
     toks = {"calsanova": cal, "scythene": scy}
@@ -75,6 +117,10 @@ def main():
         d = now.date() + datetime.timedelta(weeks=i)
         y, w, _ = d.isocalendar()
         future_weeks.append(f"{y}-W{w:02d}")
+
+    if args.failures_only:
+        _report_failures(now, toks)
+        return
 
     counts = collections.defaultdict(int)  # (brand, platform, week) -> n
     for brand, org in ORGS.items():
@@ -108,6 +154,8 @@ def main():
             print(f"  {b} {p} {wk}: {c}/{args.floor} — schedule {args.floor - c} more")
     else:
         print("\nAll future weeks meet the floor. (Current partial week not flagged.)")
+
+    _report_failures(now, toks)
 
 
 if __name__ == "__main__":
